@@ -25,7 +25,7 @@ __version__ = '1.2.4'
 LOGGER = logging.getLogger('encrypt-existing-volumes')
 LOGGER.setLevel(logging.DEBUG)
 STREAM_HANDLER = logging.StreamHandler()
-STREAM_HANDLER.setLevel(logging.DEBUG)
+STREAM_HANDLER.setLevel(logging.INFO)
 LOGGER.addHandler(STREAM_HANDLER)
 
 # Constants
@@ -69,6 +69,8 @@ class EC2Cryptomatic:
         self._force_stop = force_stop
 
         self._instance_set = set()
+        self._instance_progress = defaultdict(dict)
+        self._volume_progress = defaultdict(dict)
         for id in instances:
             self._instance_set.add(self._ec2_resource.Instance(id=id))
 
@@ -102,6 +104,7 @@ class EC2Cryptomatic:
         except ClientError:
             raise
 
+
     def _instance_is_stopped(self, instance) -> None:
         """
         Check if instance is stopped
@@ -110,7 +113,7 @@ class EC2Cryptomatic:
         """
         if instance.state['Name'] != 'stopped':
             if not self._force_stop:
-                raise TypeError('Instance still running ! please stop it.')
+                raise TypeError('Instance is still running! Please stop it.')
             else:
                 instance.stop()
                 self._wait_instance.wait(InstanceIds=[instance.id])
@@ -122,10 +125,11 @@ class EC2Cryptomatic:
         :return: None
         :except: ClientError
         """
+        prefix_string = self._make_prefix_string(instance=instance)
         try:
-            LOGGER.info(f'-- Starting instance {instance.id}')
+            LOGGER.info(f'{prefix_string} -- Starting instance {instance.id}')
             self._ec2_client.start_instances(InstanceIds=[instance.id])
-            LOGGER.info(f'-- Instance {instance.id} started')
+            LOGGER.info(f'{prefix_string} -- Instance {instance.id} started')
         except ClientError:
             raise
 
@@ -134,28 +138,28 @@ class EC2Cryptomatic:
         Delete the temporary objects
         :param device: the original device to delete
         """
-
-        LOGGER.info('-- Cleanup of resources')
+        prefix_string = self._make_prefix_string(volume=device) + ' [CLEANUP]'
+        # LOGGER.info(f'{prefix_string} Cleanup of resources')
 
         if self._discard_source:
             self._wait_volume.wait(VolumeIds=[device.id])
-            LOGGER.info(f'--- Deleting unencrypted volume {device.id}')
+            LOGGER.info(f'{prefix_string} [DELETING] Unencrypted Volume {device.id}')
             device.delete()
 
         else:
-            LOGGER.info(f'--- Preserving unencrypted volume {device.id}')
+            LOGGER.info(f'{prefix_string} [PRESERVING] Unencrypted Volume {device.id}')
 
 
         snapshot, encrypted_snapshot = snapshots
         if self._discard_snapshot:
-            LOGGER.info(f'--- Deleting unencrypted snapshot {snapshot.id}')
+            LOGGER.info(f'{prefix_string} [DELETING] Unencrypted Snapshot {snapshot.id}')
             snapshot.delete()
-            LOGGER.info(f'--- Deleting encrypted snapshot {encrypted_snapshot.id}')
+            LOGGER.info(f'{prefix_string} [DELETING] Encrypted Snapshot {encrypted_snapshot.id}')
             encrypted_snapshot.delete()
 
         else:
-            LOGGER.info(f'--- Preserving unencrypted snapshot {snapshot.id}')
-            LOGGER.info(f'--- Preserving encrypted snapshot {encrypted_snapshot.id}')
+            LOGGER.info(f'{prefix_string} [PRESERVING] Unencrypted Snapshot {snapshot.id}')
+            LOGGER.info(f'{prefix_string} [PRESERVING] Encrypted Snapshot {encrypted_snapshot.id}')
 
 
     def _create_volume(self, snapshot, original_device):
@@ -164,21 +168,25 @@ class EC2Cryptomatic:
         :param snapshot: an encrypted snapshot
         :param original_device: device where take additional information
         """
+        prefix_string = self._make_prefix_string(volume=original_device)
         vol_args = {'SnapshotId': snapshot.id,
                     'VolumeType': original_device.volume_type,
                     'AvailabilityZone': original_device.availability_zone}
 
         if original_device.volume_type.startswith('io'):
-            LOGGER.info(f'-- Provisioned IOPS volume detected (with '
+            LOGGER.info(f'{prefix_string} Provisioned IOPS volume detected (with '
                         f'{original_device.iops} IOPS)')
             vol_args['Iops'] = original_device.iops
 
-        LOGGER.info(f'-- Creating an encrypted volume from {snapshot.id}')
 
         elif original_device.volume_type == 'gp3':
+            LOGGER.info(f'{prefix_string} GP3 volume detected (with '
+                        f'{original_device.iops} IOPS and {original_device.throughput})')
             vol_args['Iops'] = original_device.iops
             vol_args['Throughput'] = original_device.throughput
 
+
+        LOGGER.info(f'{prefix_string} [CREATING] Encrypted Volume from {snapshot.id}')
         volume = self._ec2_resource.create_volume(**vol_args)
         self._wait_volume.wait(VolumeIds=[volume.id])
 
@@ -191,36 +199,41 @@ class EC2Cryptomatic:
 
         return volume
 
+
     def _swap_device(self, instance, old_volume, new_volume) -> None:
         """
         Swap the old device with the new encrypted one
         :param old_volume: volume to detach from the instance
         :param new_volume: volume to attach to the instance
         """
-
-        LOGGER.info('-- Swap the old volume and the new one')
+        prefix_string = self._make_prefix_string(volume=old_volume)
+        LOGGER.info(f'{prefix_string} [SWAPPING] Old Volume {old_volume.id} and New Volume {new_volume.id}')
         device = old_volume.attachments[0]['Device']
         instance.detach_volume(Device=device, VolumeId=old_volume.id)
         self._wait_volume.wait(VolumeIds=[old_volume.id])
         instance.attach_volume(Device=device, VolumeId=new_volume.id)
+
 
     def _take_snapshot(self, device):
         """
         Take the first snapshot from the volume to encrypt
         :param device: EBS device to encrypt
         """
-        LOGGER.info(f'-- Take a snapshot for volume {device.id}')
-        snapshot = device.create_snapshot(Description=f'snap of {device.id}')
+        prefix_string = self._make_prefix_string(volume=device)
+        LOGGER.info(f'{prefix_string} [SNAPSHOT] Volume {device.id}')
+        snapshot = device.create_snapshot(Description=f'Snapshot of {device.id}')
         self._wait_snapshot.wait(SnapshotIds=[snapshot.id])
 
         return snapshot
 
-    def _copy_snapshot(self, snapshot):
+
+    def _copy_snapshot(self, snapshot, volume):
         """
         Copy the first snapshot to another encrypted snapshot
         :param snapshot: EBS device to encrypt
         """
-        LOGGER.info(f'-- Copying a encrypted snapshot from {snapshot.id}')
+        prefix_string = self._make_prefix_string(volume=volume)
+        LOGGER.info(f'{prefix_string} [COPYING] Encrypted Snapshot from {snapshot.id}')
         snapshot_dict = snapshot.copy(Encrypted=True,
                                       KmsKeyId=self._kms_key,
                                       SourceRegion=self._region,
@@ -230,6 +243,33 @@ class EC2Cryptomatic:
 
         return self._ec2_resource.Snapshot(snapshot_dict['SnapshotId'])
 
+
+    def _make_prefix_string(self, instance=None, volume=None, instance_id=None):
+        prefix_string = ""
+        if volume:
+            instance_id = self._volume_progress[volume.id]['instance_id']
+
+        if instance:
+            instance_id = instance.id
+        if instance_id:
+            prefix_string += f"[i{self._instance_progress[instance_id]['index']}] "
+
+        if volume:
+            prefix_string += f"[v{self._volume_progress[volume.id]['index']}] "
+
+
+        return prefix_string.rstrip()
+
+
+    def _instance_is_ready(self, instance):
+        prefix_string = self._make_prefix_string(instance=instance)
+        LOGGER.info(f'{prefix_string} [CHECKING] [EXISTS?] Instance {instance.id}')
+        self._instance_is_exists(instance=instance)
+
+        LOGGER.info(f'{prefix_string} [CHECKING] [STOPPED?] Instance {instance.id}')
+        self._instance_is_stopped(instance=instance)
+
+
     def start_encryption(self) -> None:
         """
         Launch encryption process
@@ -238,45 +278,43 @@ class EC2Cryptomatic:
         :return: None
         """
 
-        for instance in self._instance_set:
-            LOGGER.info(f'Checking if instance {instance.id} exists')
-            self._instance_is_exists(instance=instance)
-            LOGGER.info(f'Checking if instance {instance.id} is stopped')
-            self._instance_is_stopped(instance=instance)
+        volume_m = 0
+        for n, instance in enumerate(self._instance_set, start=1):
 
-            LOGGER.info(f'\nStarting to encrypt instance {instance.id}')
+            self._instance_progress[instance.id]['index'] = n
+            self._instance_is_ready(instance)
 
-            # We encrypt only EC2 EBS-backed. Support of instance store will be
-            # added later
+            prefix_string = self._make_prefix_string(instance=instance)
+            LOGGER.info(f'{prefix_string} Starting to encrypt instance {instance.id}')
+
             for device in instance.block_device_mappings:
                 if 'Ebs' not in device:
-                    msg = f'{instance.id}: Skip {device["VolumeId"]} not an EBS device'
+                    msg = f'{prefix_string} {instance.id}: Skip {device["VolumeId"]} not an EBS device'
                     LOGGER.warning(msg)
                     continue
 
             for device in instance.volumes.all():
                 if device.encrypted:
-                    msg = f'{instance.id}: Volume {device.id} already encrypted'
+                    msg = f'{prefix_string} {instance.id}: Volume {device.id} already encrypted'
                     LOGGER.warning(msg)
                     continue
 
+                volume_m += 1
+                self._volume_progress[device.id] = {'index': volume_m, 'instance_id': instance.id}
                 self.single_encryption(instance, device)
 
             if self._after_start:
                 # starting the stopped instance
                 self._start_instance(instance)
 
-            LOGGER.info(f'End of work on instance {instance.id}\n')
+            LOGGER.info(f'{prefix_string} [FINISHED] Instance {instance.id}\n')
 
-    # TODO: create threads for instance exists and stops
+
     def start_encryptions(self) -> None:
         num_volumes = 0
         instance_device_pairs = defaultdict(set)
 
         for instance in self._instance_set:
-            # We encrypt only EC2 EBS-backed. Support of instance store will be
-            # added later
-
             for device in instance.block_device_mappings:
                 if 'Ebs' not in device:
                     msg = f'{instance.id}: Skip {device["VolumeId"]} not an EBS device'
@@ -292,8 +330,14 @@ class EC2Cryptomatic:
                     instance_device_pairs[instance].add(device)
                     num_volumes += 1
 
-        semaphore = Semaphore(concurrent_snapshot_copies_limits.get(self._region,
-                                                                    default_concurrent_snapshot_copies_limit))
+        volume_m = 0
+        for n, (instance, volumes) in enumerate(instance_device_pairs.items(), start=1):
+            self._instance_progress[instance.id]['index'] = n
+            for volume in volumes:
+                volume_m += 1
+                self._volume_progress[volume.id]['index'] = volume_m
+                self._volume_progress[volume.id]['instance_id'] = instance.id
+
 
         with ThreadPoolExecutor() as executor:
             executor.map(self._instance_is_ready, instance_device_pairs.keys())
@@ -308,7 +352,7 @@ class EC2Cryptomatic:
                               for device in devices]
 
             for finished, future in enumerate(as_completed(result_futures), start=1):
-                LOGGER.info(f"{finished}/{num_volumes} Done...")
+                LOGGER.info(f"********** {finished}/{num_volumes} Done **********")
                 try:
                     ret_instance, ret_volume = future.result()
                 except Exception:
@@ -320,26 +364,22 @@ class EC2Cryptomatic:
 
                 if not volumes_left:
 
+                    prefix_string = self._make_prefix_string(instance=ret_instance)
                     if self._after_start:
                         # starting the stopped instance
                         self._start_instance(ret_instance)
-                        LOGGER.info(f'Starting instance {ret_instance.id}')
+                        LOGGER.info(f'{prefix_string} [STARTING] Instance {ret_instance.id}')
 
-                    LOGGER.info(f'End of work on instance {ret_instance.id}')
+                    LOGGER.info(f'{prefix_string} [FINISHED] Instance {ret_instance.id}')
 
 
-        LOGGER.info(f'End of work on all instances, with total of {num_volumes} volumes converted.')
+        LOGGER.info(f'>>> End of work on all instances, with a total of {num_volumes} volumes converted.')
+
 
 
     def single_encryption(self, instance, device, semaphore=None):
-
-        LOGGER.info(f'Checking if instance {instance.id} exists')
-        self._instance_is_exists(instance=instance)
-
-        LOGGER.info(f'Checking if instance {instance.id} is stopped')
-        self._instance_is_stopped(instance=instance)
-
-        LOGGER.info(f"- Let's encrypt volume {device.id}")
+        prefix_string = self._make_prefix_string(instance=instance, volume=device)
+        LOGGER.debug(f"{prefix_string} Starting to encrypt volume {device.id}")
 
         # Keep in mind if DeleteOnTermination is need
         delete_flag = device.attachments[0]['DeleteOnTermination']
@@ -353,7 +393,7 @@ class EC2Cryptomatic:
         # this limititation is from aws rate limits (ConcurrentSnapshotCopies)
         if semaphore:
             semaphore.acquire()
-        snapshot_copy = self._copy_snapshot(snapshot)
+        snapshot_copy = self._copy_snapshot(snapshot, device)
         if semaphore:
             semaphore.release()
 
@@ -366,7 +406,7 @@ class EC2Cryptomatic:
         self._cleanup(device=device, snapshots=[snapshot, snapshot_copy])
 
         if not self._discard_source:
-            LOGGER.info(f'- Tagging legacy volume {device.id} with '
+            LOGGER.info(f'{prefix_string} Tagging legacy volume {device.id} with '
                         f'replacement id {volume.id}')
             device.create_tags(Tags=[{'Key': 'encryptedReplacement',
                                       'Value': volume.id},
@@ -374,11 +414,11 @@ class EC2Cryptomatic:
                                       'Value': instance.id}])
 
         if delete_flag:
-            LOGGER.info('-- Put flag DeleteOnTermination on volume')
+            LOGGER.info('{prefix_string} Put flag DeleteOnTermination on volume')
             instance.modify_attribute(BlockDeviceMappings=[flag_on])
             LOGGER.info('')
 
-        LOGGER.info(f'End of work on volume {device.id}')
+        LOGGER.info(f'{prefix_string} [FINISHED] Volume {device.id}')
 
         return instance, device
 
