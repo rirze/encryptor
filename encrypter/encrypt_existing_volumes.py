@@ -34,9 +34,18 @@ DELAY_RETRY = 15
 
 # Rate limits
 concurrent_snapshot_copies_limits = {
-    'us-isob-east-1': 5
+    'us-gov': 5,
+    'us-iso': 5,
+    'cn': 5
 }
 default_concurrent_snapshot_copies_limit = 20
+
+def find_region_limit(region):
+    for prefix, limit in concurrent_snapshot_copies_limits.items():
+        if region.startswith(prefix):
+            return limit
+
+    return default_concurrent_snapshot_copies_limit
 
 
 class EC2Cryptomatic:
@@ -165,6 +174,11 @@ class EC2Cryptomatic:
             vol_args['Iops'] = original_device.iops
 
         LOGGER.info(f'-- Creating an encrypted volume from {snapshot.id}')
+
+        elif original_device.volume_type == 'gp3':
+            vol_args['Iops'] = original_device.iops
+            vol_args['Throughput'] = original_device.throughput
+
         volume = self._ec2_resource.create_volume(**vol_args)
         self._wait_volume.wait(VolumeIds=[volume.id])
 
@@ -280,6 +294,13 @@ class EC2Cryptomatic:
 
         semaphore = Semaphore(concurrent_snapshot_copies_limits.get(self._region,
                                                                     default_concurrent_snapshot_copies_limit))
+
+        with ThreadPoolExecutor() as executor:
+            executor.map(self._instance_is_ready, instance_device_pairs.keys())
+
+
+        semaphore = Semaphore(find_region_limit(self._region))
+
         with ThreadPoolExecutor() as executor:
 
             result_futures = [executor.submit(self.single_encryption, instance, device, semaphore=semaphore)
