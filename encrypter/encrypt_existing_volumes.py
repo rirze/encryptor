@@ -19,8 +19,6 @@ from typing import List
 import boto3
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-__version__ = '1.2.4'
-
 # Define the global logger
 LOGGER = logging.getLogger('encrypt-existing-volumes')
 LOGGER.setLevel(logging.DEBUG)
@@ -48,7 +46,7 @@ def find_region_limit(region):
     return default_concurrent_snapshot_copies_limit
 
 
-class EC2Cryptomatic:
+class Encryptor:
     """ Encrypt EBS volumes on EC2 instance(s) """
 
     def __init__(self, region: str, instances: List[str], key: str, discard_source: bool, discard_snapshot: bool, after_start: bool, force_stop: bool):
@@ -221,7 +219,11 @@ class EC2Cryptomatic:
         """
         prefix_string = self._make_prefix_string(volume=device)
         LOGGER.info(f'{prefix_string} [SNAPSHOT] Volume {device.id}')
-        snapshot = device.create_snapshot(Description=f'Snapshot of {device.id}')
+        snapshot = device.create_snapshot(Description=f'[VOLUME-ENCRYPTION] Snapshot of {device.id}')
+        snapshot.create_tags(Tags=[{'Key': 'Issuer',
+                                    'Value': 'Volume-Encryption'},
+                                   {'Key': 'Type',
+                                    'Value': 'Unencrypted Snapshot'}])
         self._wait_snapshot.wait(SnapshotIds=[snapshot.id])
 
         return snapshot
@@ -238,7 +240,11 @@ class EC2Cryptomatic:
                                       KmsKeyId=self._kms_key,
                                       SourceRegion=self._region,
                                       Description=f'Encrypted Snapshot of {snapshot.id}')
-
+        snapshot_copy = self._ec2_resource.Snapshot(snapshot_dict['SnapshotId'])
+        snapshot_copy.create_tags(Tags=[{'Key': 'Issuer',
+                                         'Value': 'Volume-Encryption'},
+                                        {'Key': 'Type',
+                                         'Value': 'Encrypted Snapshot'}])
         self._wait_snapshot.wait(SnapshotIds=[snapshot_dict['SnapshotId']])
 
         return self._ec2_resource.Snapshot(snapshot_dict['SnapshotId'])
@@ -406,8 +412,8 @@ class EC2Cryptomatic:
         self._cleanup(device=device, snapshots=[snapshot, snapshot_copy])
 
         if not self._discard_source:
-            LOGGER.info(f'{prefix_string} Tagging legacy volume {device.id} with '
-                        f'replacement id {volume.id}')
+            LOGGER.info(f'{prefix_string} [TAGGING] Legacy Volume {device.id} with '
+                        f'Encrypted Volume ID {volume.id}')
             device.create_tags(Tags=[{'Key': 'encryptedReplacement',
                                       'Value': volume.id},
                                      {'Key': 'sourceInstanceId',
@@ -430,13 +436,13 @@ def main(args: argparse.Namespace) -> None:
     :return: None
     """
     try:
-        encrypt_ec2_class = EC2Cryptomatic(region=args.region,
-                                           instances=args.instances,
-                                           key=args.key,
-                                           discard_source=args.discard_source_volume,
-                                           discard_snapshot=args.discard_snapshot,
-                                           after_start=args.after_start,
-                                           force_stop=args.force_stop)
+        encrypt_ec2_class = Encryptor(region=args.region,
+                                      instances=args.instances,
+                                      key=args.key,
+                                      discard_source=args.discard_source_volume,
+                                      discard_snapshot=args.discard_snapshot,
+                                      after_start=args.after_start,
+                                      force_stop=args.force_stop)
 
         if args.disable_async:
             encrypt_ec2_class.start_encryption()
@@ -460,7 +466,7 @@ def parse_arguments(only_known=False) -> argparse.Namespace:
     Parse arguments from CLI
     :returns: argparse.Namespace
     """
-    description = 'EC2Cryptomatic - Encrypt EBS volumes from EC2 instances'
+    description = 'Encrypt EBS volumes from EC2 instances'
     parser = argparse.ArgumentParser(description=description)
     region = os.environ.get('AWS_REGION', os.environ.get('REGION'))
 
@@ -482,8 +488,6 @@ def parse_arguments(only_known=False) -> argparse.Namespace:
                         help='Start instances after encryption (default: False)')
     parser.add_argument('-s', '--force-stop', action='store_true',
                         help='Force stop instances before encryption (default: False)')
-
-    parser.add_argument('-v', '--version', action='version', version=__version__)
 
     if only_known:
         return parser.parse_known_args()[0]
