@@ -179,7 +179,8 @@ class Encryptor:
 
         elif original_device.volume_type == 'gp3':
             LOGGER.info(f'{prefix_string} GP3 volume detected (with '
-                        f'{original_device.iops} IOPS and {original_device.throughput})')
+                        f'{original_device.iops} IOPS'
+                        f'and {original_device.throughput} Throughput)')
             vol_args['Iops'] = original_device.iops
             vol_args['Throughput'] = original_device.throughput
 
@@ -331,7 +332,7 @@ class Encryptor:
 
             for device in instance.volumes.all():
                 if device.encrypted:
-                    msg = f'{instance.id}: Volume {device.id} already encrypted'
+                    msg = f'[CHECKING] {instance.id}: Volume {device.id} is already encrypted'
                     LOGGER.warning(msg)
 
                 else:
@@ -384,14 +385,13 @@ class Encryptor:
 
                     LOGGER.info(f'{prefix_string} [FINISHED] Instance {ret_instance.id}')
 
-
         LOGGER.info(f'>>> End of work on all instances, with a total of {num_volumes} volumes converted.')
 
 
 
     def single_encryption(self, instance, device, semaphore=None):
         prefix_string = self._make_prefix_string(instance=instance, volume=device)
-        LOGGER.debug(f"{prefix_string} Starting to encrypt volume {device.id}")
+        LOGGER.debug(f"{prefix_string} Starting to encrypt Volume {device.id}")
 
         # Keep in mind if DeleteOnTermination is need
         delete_flag = device.attachments[0]['DeleteOnTermination']
@@ -414,7 +414,7 @@ class Encryptor:
                                      original_device=device)
         # Finally, swap the old-device for the new one
         self._swap_device(instance=instance, old_volume=device, new_volume=volume)
-        # It's time to tidy up !
+        # cleanup
         self._cleanup(device=device, snapshots=[snapshot, snapshot_copy])
 
         if not self._discard_source:
