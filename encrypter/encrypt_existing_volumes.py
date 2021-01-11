@@ -51,7 +51,7 @@ def find_region_limit(region):
 class Encryptor:
     """ Encrypt EBS volumes on EC2 instance(s) """
 
-    def __init__(self, region: str, instances: List[str], key: str, discard_source: bool, discard_snapshot: bool, after_start: bool, force_stop: bool):
+    def __init__(self, region: str, instances: List[str], key: str, discard_source: bool=False, discard_snapshot: bool=False, after_start: bool=False, force_stop: bool=False, one_key:bool=False):
         """
         Initialization
         :param region: (str) the AWS region where the instance is
@@ -67,6 +67,7 @@ class Encryptor:
         self._discard_snapshot = discard_snapshot
         self._after_start      = after_start
         self._force_stop       = force_stop
+        self._one_key          = self._get_kms_key_id(key) if one_key else False
 
         self._instance_set      = set()
         self._instance_progress = defaultdict(dict)
@@ -83,6 +84,12 @@ class Encryptor:
         for waiter in (self._wait_snapshot, self._wait_snapshot, self._wait_instance):
             waiter.config.max_attempts = MAX_RETRIES
             waiter.config.delay        = DELAY_RETRY
+
+
+    def _get_kms_key_id(self, key_id):
+        kms = boto3.client('kms', region_name=self._region)
+        response = kms.describe_key(KeyId=key_id)
+        return response['KeyMetadata']['Arn']
 
 
     def _instance_is_exists(self, instance=None, instance_id=None) -> None:
@@ -308,8 +315,12 @@ class Encryptor:
             for device in instance.volumes.all():
                 if device.encrypted:
                     msg = f'{prefix_string} {instance.id}: Volume {device.id} already encrypted'
-                    LOGGER.warning(msg)
-                    continue
+                    if self._one_key and device.kms_key_id != self._one_key:
+                        msg += f" but using a different encryption key. Reencryping..."
+                    else:
+                        LOGGER.warning(msg)
+                        continue
+                    LOGGER.info(msg)
 
                 volume_m += 1
                 self._volume_progress[device.id] = {'index': volume_m, 'instance_id': instance.id}
@@ -335,9 +346,13 @@ class Encryptor:
 
             for device in instance.volumes.all():
                 if device.encrypted:
-                    msg = f'[CHECKING] {instance.id}: Volume {device.id} is already encrypted'
-                    LOGGER.warning(msg)
-
+                    msg = f'[CHECKING] {instance.id}: Volume {device.id} already encrypted'
+                    if self._one_key and device.kms_key_id != self._one_key:
+                        msg += f" but using a different encryption key. Reencryping..."
+                    else:
+                        LOGGER.warning(msg)
+                        continue
+                    LOGGER.info(msg)
                 else:
                     instance_device_pairs[instance].add(device)
                     num_volumes += 1
@@ -456,7 +471,8 @@ def main(args: argparse.Namespace) -> None:
                                       discard_source=args.discard_source_volume,
                                       discard_snapshot=args.discard_snapshot,
                                       after_start=args.after_start,
-                                      force_stop=args.force_stop)
+                                      force_stop=args.force_stop,
+                                      one_key=args.one_key)
 
         if args.disable_async:
             encrypt_ec2_class.start_encryption()
@@ -482,8 +498,8 @@ def parse_arguments(only_known=False) -> argparse.Namespace:
     """
     description = 'Encrypt EBS volumes from EC2 instances'
     parser = argparse.ArgumentParser(description=description)
-    region = os.environ.get('AWS_REGION', os.environ.get('REGION'))
 
+    region = os.environ.get('AWS_REGION', os.environ.get('REGION'))
     if region:
         parser.add_argument('-r', '--region', help='AWS Region', default=region)
     else:
@@ -492,6 +508,9 @@ def parse_arguments(only_known=False) -> argparse.Namespace:
     parser.add_argument('-i', '--instances', nargs='+',
                         help='Instance to encrypt', required=True)
     parser.add_argument('-k', '--key', help="KMS Key ID. For alias, add prefix 'alias/'", default='alias/aws/ebs')
+    parser.add_argument('-1', '--one-key', action='store_true',
+                        help="Force volumes to be encrypted by only one key, the one specified."
+                        " If they are encrypted by another key, this flag will force them to be reencrypted.")
     parser.add_argument('-da', '--disable-async', action='store_true',
                         help="Don't run Asynchronously, runs operations in serial rather than parallel (default: False)")
     parser.add_argument('-dv', '--discard-source-volume', action='store_true',
