@@ -10,11 +10,11 @@ import argparse
 import logging
 import os
 import sys
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Semaphore
 from traceback import TracebackException, print_exc
-from typing import List
+from typing import Deque, List, Tuple
 
 import boto3
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -347,46 +347,48 @@ class Encryptor:
                 self._volume_progress[volume.id]['index'] = volume_m
                 self._volume_progress[volume.id]['instance_id'] = instance.id
 
-
-        # def shutdown_and_encrypt(instance, semaphore=None):
-        #     self._instance_is_ready(instance)
-
         snapshot_copies_limit = Semaphore(find_region_limit(self._region))
+        finished = 0
 
         with ThreadPoolExecutor() as executor:
-            instance_futures = [executor.submit(self._instance_is_ready, instance)
-                                for instance in instance_device_pairs.keys()]
+            futures: Deque[Tuple[str, Future]] = deque(
+                ("I", executor.submit(self._instance_is_ready, instance))
+                for instance in instance_device_pairs)
 
-            result_futures = []
-            for future in as_completed(instance_futures):
-                instance = future.result()
-                result_futures.extend(executor.submit(self.single_encryption, instance, device, semaphore=snapshot_copies_limit)
-                                      for device in instance_device_pairs[instance])
+            # the following emulates "as_completed" behavior
+            # reason we need it: we want futures to complete for both
+            #  shutdowning instances and starting encryption at the same time.
+            while futures:
+                while not futures[0][1].done():
+                    futures.rotate()
+                enum, future = futures.popleft()
+                if enum == "I":
+                    instance = future.result()
+                    futures.extend((("V", executor.submit(self.single_encryption, instance, device, semaphore=snapshot_copies_limit))
+                                    for device in instance_device_pairs[instance]))
+                elif enum == "V":
+                    finished += 1
+                    LOGGER.info(f">>> {finished}/{num_volumes} Done ")
+                    try:
+                        ret_instance, ret_volume = future.result()
+                    except Exception:
+                        print_exc()
+                        continue
+                    volumes_left = instance_device_pairs[ret_instance]
 
-            # TODO: add workaround so following kicks off as soon as encryption starts, not after all instances stand down
-            for finished, future in enumerate(as_completed(result_futures), start=1):
-                LOGGER.info(f">>> {finished}/{num_volumes} Done ")
-                try:
-                    ret_instance, ret_volume = future.result()
-                except Exception:
-                    print_exc()
-                    continue
-                volumes_left = instance_device_pairs[ret_instance]
+                    volumes_left.discard(ret_volume)
 
-                volumes_left.discard(ret_volume)
+                    if not volumes_left:
 
-                if not volumes_left:
+                        prefix_string = self._make_prefix_string(instance=ret_instance)
+                        if self._after_start:
+                            # starting the stopped instance
+                            self._start_instance(ret_instance)
+                            LOGGER.info(f'{prefix_string} [STARTING] Instance {ret_instance.id}')
 
-                    prefix_string = self._make_prefix_string(instance=ret_instance)
-                    if self._after_start:
-                        # starting the stopped instance
-                        self._start_instance(ret_instance)
-                        LOGGER.info(f'{prefix_string} [STARTING] Instance {ret_instance.id}')
-
-                    LOGGER.info(f'{prefix_string} [FINISHED] Instance {ret_instance.id}')
+                        LOGGER.info(f'{prefix_string} [FINISHED] Instance {ret_instance.id}')
 
         LOGGER.info(f'>>> End of work on all instances, with a total of {num_volumes} volumes converted.')
-
 
 
     def single_encryption(self, instance, device, semaphore=None):
