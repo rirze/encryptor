@@ -31,12 +31,14 @@ MAX_RETRIES = 360 * 4
 DELAY_RETRY = 15
 
 # Rate limits
+# This is the bottleneck in this process as of Mon 11 Jan 2021
 concurrent_snapshot_copies_limits = {
     'us-gov': 5,
     'us-iso': 5,
     'cn': 5
 }
 default_concurrent_snapshot_copies_limit = 20
+
 
 def find_region_limit(region):
     for prefix, limit in concurrent_snapshot_copies_limits.items():
@@ -56,31 +58,31 @@ class Encryptor:
         :param instance: (str) one instance-id
         :param key: (str) the AWS KMS Key to be used to encrypt the volume
         """
-        self._kms_key = key
-        self._ec2_client = boto3.client('ec2', region_name=region)
+        self._kms_key      = key
+        self._ec2_client   = boto3.client('ec2', region_name=region)
         self._ec2_resource = boto3.resource('ec2', region_name=region)
-        self._region = region
+        self._region       = region
 
-        self._discard_source = discard_source
+        self._discard_source   = discard_source
         self._discard_snapshot = discard_snapshot
-        self._after_start = after_start
-        self._force_stop = force_stop
+        self._after_start      = after_start
+        self._force_stop       = force_stop
 
-        self._instance_set = set()
+        self._instance_set      = set()
         self._instance_progress = defaultdict(dict)
-        self._volume_progress = defaultdict(dict)
+        self._volume_progress   = defaultdict(dict)
         for id in instances:
             self._instance_set.add(self._ec2_resource.Instance(id=id))
 
         # Waiters
         self._wait_snapshot = self._ec2_client.get_waiter('snapshot_completed')
-        self._wait_volume = self._ec2_client.get_waiter('volume_available')
+        self._wait_volume   = self._ec2_client.get_waiter('volume_available')
         self._wait_instance = self._ec2_client.get_waiter('instance_stopped')
 
         # Waiters retries values
         for waiter in (self._wait_snapshot, self._wait_snapshot, self._wait_instance):
             waiter.config.max_attempts = MAX_RETRIES
-            waiter.config.delay = DELAY_RETRY
+            waiter.config.delay        = DELAY_RETRY
 
 
     def _instance_is_exists(self, instance=None, instance_id=None) -> None:
@@ -125,9 +127,9 @@ class Encryptor:
         """
         prefix_string = self._make_prefix_string(instance=instance)
         try:
-            LOGGER.info(f'{prefix_string} -- Starting instance {instance.id}')
+            LOGGER.info(f'{prefix_string} [STARTING] instance {instance.id}')
             self._ec2_client.start_instances(InstanceIds=[instance.id])
-            LOGGER.info(f'{prefix_string} -- Instance {instance.id} started')
+            LOGGER.info(f'{prefix_string} [STARTED] Instance {instance.id}')
         except ClientError:
             raise
 
@@ -242,6 +244,7 @@ class Encryptor:
                                       SourceRegion=self._region,
                                       Description=f'Encrypted Snapshot of {snapshot.id}')
         snapshot_copy = self._ec2_resource.Snapshot(snapshot_dict['SnapshotId'])
+
         snapshot_copy.create_tags(Tags=[{'Key': 'Issuer',
                                          'Value': 'Volume-Encryption'},
                                         {'Key': 'Type',
@@ -339,6 +342,8 @@ class Encryptor:
                     instance_device_pairs[instance].add(device)
                     num_volumes += 1
 
+        # reason for not integrating this above is we only want resources that need to be encrypted.
+        # if user passes in instances that don't have unencrypted volumes, don't count it!
         volume_m = 0
         for n, (instance, volumes) in enumerate(instance_device_pairs.items(), start=1):
             self._instance_progress[instance.id]['index'] = n
@@ -358,6 +363,7 @@ class Encryptor:
             # the following emulates "as_completed" behavior
             # reason we need it: we want futures to complete for both
             #  shutdowning instances and starting encryption at the same time.
+            # Don't know of a way to check "as_completed" of a list/queue that is changing size
             while futures:
                 while not futures[0][1].done():
                     futures.rotate()
