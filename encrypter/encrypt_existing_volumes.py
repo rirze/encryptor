@@ -275,6 +275,8 @@ class Encryptor:
         LOGGER.info(f'{prefix_string} [CHECKING] [STOPPED?] Instance {instance.id}')
         self._instance_is_stopped(instance=instance)
 
+        return instance
+
 
     def start_encryption(self) -> None:
         """
@@ -345,20 +347,24 @@ class Encryptor:
                 self._volume_progress[volume.id]['instance_id'] = instance.id
 
 
+        # def shutdown_and_encrypt(instance, semaphore=None):
+        #     self._instance_is_ready(instance)
+
+        snapshot_copies_limit = Semaphore(find_region_limit(self._region))
+
         with ThreadPoolExecutor() as executor:
-            executor.map(self._instance_is_ready, instance_device_pairs.keys())
+            instance_futures = [executor.submit(self._instance_is_ready, instance)
+                                for instance in instance_device_pairs.keys()]
 
+            result_futures = []
+            for future in as_completed(instance_futures):
+                instance = future.result()
+                result_futures.extend(executor.submit(self.single_encryption, instance, device, semaphore=snapshot_copies_limit)
+                                      for device in instance_device_pairs[instance])
 
-        semaphore = Semaphore(find_region_limit(self._region))
-
-        with ThreadPoolExecutor() as executor:
-
-            result_futures = [executor.submit(self.single_encryption, instance, device, semaphore=semaphore)
-                              for instance, devices in instance_device_pairs.items()
-                              for device in devices]
-
+            # TODO: add workaround so following kicks off as soon as encryption starts, not after all instances stand down
             for finished, future in enumerate(as_completed(result_futures), start=1):
-                LOGGER.info(f"********** {finished}/{num_volumes} Done **********")
+                LOGGER.info(f">>> {finished}/{num_volumes} Done ")
                 try:
                     ret_instance, ret_volume = future.result()
                 except Exception:
